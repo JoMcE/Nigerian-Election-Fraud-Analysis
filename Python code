@@ -1,0 +1,801 @@
+Nigerian Electoral Fraud Detection Analysis
+# IMPORTS
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import (chisquare, pearsonr, spearmanr, kruskal, f_oneway, 
+                         chi2_contingency)
+from scipy.spatial.distance import pdist, squareform
+from statsmodels.stats.proportion import proportion_confint
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
+from sklearn.svm import OneClassSVM
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import cross_val_score
+from sklearn.metrics import (precision_score, recall_score, f1_score, 
+                           average_precision_score, silhouette_score)
+from sklearn.cluster import KMeans
+from sklearn.feature_selection import mutual_info_regression
+# Set display options
+np.set_printoptions(precision=4, suppress=True)
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', None)
+
+
+
+
+
+# DATA LOADING AND INITIAL SETUP
+def load_and_prepare_data(filepath='Combined_election_verified.csv'):
+    """Load and perform initial data preparation"""
+    df = pd.read_csv(filepath)
+    print(f"Dataset loaded: {df.shape[0]:,} polling units, {df.shape[1]} columns")
+    # Ensure party columns are numeric
+    party_cols = ['APC', 'LP', 'PDP', 'NNPP']
+    for col in party_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    # Ensure other numeric columns
+    numeric_cols = ['Registered_Voters', 'Accredited_Voters', 'Transcription_Count', 
+                   'Results_Found']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    # Convert boolean flags to 0/1
+    flag_cols = ['Result_Sheet_Stamped', 'Result_Sheet_Corrected', 
+                'Result_Sheet_Invalid', 'Result_Sheet_Unclear', 'Result_Sheet_Unsigned']
+    
+    def to_binary(x):
+        if pd.isna(x): 
+            return np.nan
+        s = str(x).strip().lower()
+        return 1 if s in {'1', 'true', 't', 'yes', 'y'} else 0
+    for col in flag_cols:
+        if col in df.columns:
+            df[col] = df[col].apply(to_binary).fillna(0).astype(int)
+    
+    return df
+
+def print_data_overview(df):
+    """Print basic statistics about the dataset"""
+    print("\n" + "="*50)
+    print("DATASET OVERVIEW")
+    print("="*50)
+    print(f"States: {df['State'].nunique()}")
+    print(f"LGAs: {df['LGA'].nunique()}")
+    print(f"Total registered voters: {df['Registered_Voters'].sum():,}")
+    print(f"Total accredited voters: {df['Accredited_Voters'].sum():,}")
+    
+    # Party vote totals
+    party_totals = df[['APC', 'LP', 'PDP', 'NNPP']].sum()
+    print(f"\nNational Results:")
+    for party, votes in party_totals.items():
+        print(f"  {party}: {votes:,} votes ({votes/party_totals.sum()*100:.1f}%)")
+
+# FEATURE ENGINEERING
+def create_fraud_features(df):
+    """Create comprehensive fraud detection features"""
+    df = df.copy()
+    # Basic calculations
+    df['turnout_rate'] = df['Accredited_Voters'] / df['Registered_Voters'].replace(0, np.nan)
+    df['vote_total'] = df[['APC', 'LP', 'PDP', 'NNPP']].sum(axis=1)
+    df['winner_votes'] = df[['APC', 'LP', 'PDP', 'NNPP']].max(axis=1)
+    df['vote_concentration'] = df['winner_votes'] / (df['vote_total'] + 1)
+    df['winner_share'] = (df['winner_votes'] / df['vote_total']) * 100
+    
+
+    # Fraud indicators
+    df['impossible_turnout'] = (df['turnout_rate'] > 1.05).astype(int)
+    df['over_voting'] = (df['vote_total'] > df['Accredited_Voters']).astype(int)
+    df['perfect_candidate'] = ((df['vote_concentration'] > 0.98) & 
+                              (df['vote_total'] > 10)).astype(int)
+    df['zero_competition'] = ((df[['APC', 'LP', 'PDP', 'NNPP']] == 0).sum(axis=1) >= 3).astype(int)
+    # Round number bias (psychological indicator of manipulation)
+    round_counts = []
+    for party in ['APC', 'LP', 'PDP', 'NNPP']:
+        round_counts.append(((df[party] % 10 == 0) & (df[party] > 0)).astype(int))
+    df['suspicious_rounds'] = (pd.concat(round_counts, axis=1).sum(axis=1) >= 3).astype(int)
+    
+    # Composite fraud score
+    fraud_indicators = ['impossible_turnout', 'over_voting', 'perfect_candidate', 
+                       'zero_competition', 'suspicious_rounds']
+    df['fraud_score'] = df[fraud_indicators].sum(axis=1)
+    
+    # Competitiveness classification
+    def classify_unit(share):
+        if share < 40: return "Highly competitive"
+        if share < 60: return "Competitive"
+        if share < 80: return "Dominant"
+        return "Hegemonic"
+    
+    df['Unit_type'] = df['winner_share'].apply(classify_unit)
+    
+    return df
+
+# MACHINE LEARNING ANOMALY DETECTION
+def detect_anomalies_ml(df, contamination=0.05):
+    """Use multiple ML models for anomaly detection"""
+    ml_features = [
+        'turnout_rate', 'vote_concentration', 'impossible_turnout',
+        'over_voting', 'perfect_candidate', 'zero_competition', 'suspicious_rounds'
+    ]
+    
+    # Prepare data
+    X = df[ml_features].fillna(0)
+    X = X.replace([np.inf, -np.inf], 0)
+    # Scale features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # Pseudo-labels for supervised methods
+    y_pseudo = (df['fraud_score'] >= 2).astype(int)
+    
+    # Initialize models
+    models = {
+        "Isolation Forest": IsolationForest(
+            contamination=contamination,
+            random_state=42,
+            n_estimators=100,
+            n_jobs=-1
+        ),
+        "One-Class SVM": OneClassSVM(kernel="rbf", gamma="scale", nu=contamination),
+        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42)
+    }
+    
+    results = []
+    predictions = {}
+    
+    print("\n" + "="*50)
+    print("MACHINE LEARNING ANOMALY DETECTION")
+    print("="*50)
+    
+    for name, model in models.items():
+        if name == "Random Forest":
+            model.fit(X, y_pseudo)
+            preds = model.predict(X)
+        else:
+            preds = model.fit_predict(X_scaled)
+            preds = (preds == -1).astype(int)
+        
+        predictions[name] = preds
+        
+        # Evaluate
+        prec = precision_score(y_pseudo, preds, zero_division=0)
+        rec = recall_score(y_pseudo, preds, zero_division=0)
+        f1 = f1_score(y_pseudo, preds, zero_division=0)
+        
+        results.append([name, prec, rec, f1])
+        print(f"{name}: Precision={prec:.3f}, Recall={rec:.3f}, F1={f1:.3f}")
+    
+    # Ensemble (majority vote)
+    ensemble_preds = ((predictions["Isolation Forest"] + 
+                      predictions["One-Class SVM"] + 
+                      predictions["Random Forest"]) >= 2).astype(int)
+    
+    df['is_anomaly'] = ensemble_preds
+    df['anomaly_score'] = models["Isolation Forest"].decision_function(X_scaled)
+    
+    print(f"\nEnsemble anomalies detected: {ensemble_preds.sum():,} "
+          f"({ensemble_preds.mean()*100:.2f}%)")
+    
+    return df, models, scaler, pd.DataFrame(results, 
+                                            columns=["Model", "Precision", "Recall", "F1"])
+
+# STATISTICAL TESTS
+def extract_digits(series, which="first"):
+    """Extract first, second, or last digits from a series"""
+    x = series.dropna().astype(int)
+    x = x[x > 0]
+    s = x.astype(str)
+    
+    if which == "first":
+        return s.str[0].astype(int)
+    elif which == "second":
+        # Take second significant digit; skip 1-digit numbers
+        s2 = s[s.str.len() >= 2].str.replace(r"^0+", "", regex=True)
+        return s2[s2.str.len() >= 2].str[1].astype(int)
+    elif which == "last":
+        return s.str[-1].astype(int)
+    else:
+        raise ValueError("which must be first|second|last")
+
+def benford_law_test(vote_series, which="first", alpha=0.01):
+    """Test if votes follow Benford's Law"""
+    digits = extract_digits(vote_series, which=which)
+    
+    if len(digits) < 50:  # Need sufficient sample size
+        return None, None, None, None
+    
+    # Count occurrences
+    if which == "first":
+        domain = range(1, 10)
+        expected_props = np.array([np.log10(1 + 1/d) for d in domain])
+    elif which == "second":
+        domain = range(10)
+        expected_props = []
+        for d in domain:
+            expected_props.append(sum(np.log10(1 + 1/(10*k + d)) for k in range(1, 10)))
+        expected_props = np.array(expected_props)
+    else:  # last digit - should be uniform
+        domain = range(10)
+        expected_props = np.ones(10) / 10
+    
+    observed = pd.Series(digits).value_counts().reindex(domain, fill_value=0).sort_index().values
+    expected = expected_props * len(digits)
+    
+    if np.any(expected <= 0):
+        return None, None, None, None
+    
+
+    try:
+        chi2_stat, p_value = chisquare(observed, expected)
+        return chi2_stat, p_value, observed, expected
+    except Exception:
+        return None, None, None, None
+
+def perform_benford_analysis(df, parties=['APC', 'LP', 'PDP', 'NNPP']):
+    """Comprehensive Benford's Law analysis"""
+    print("\n" + "="*50)
+    print("BENFORD'S LAW ANALYSIS")
+    print("="*50)
+    
+    results = []
+    
+    # National level
+    for party in parties:
+        for digit_type in ['first', 'second']:
+            chi2, p_val, obs, exp = benford_law_test(df[party], which=digit_type)
+            if chi2 is not None:
+                results.append({
+                    'Level': 'National',
+                    'Party': party,
+                    'Digit': digit_type,
+                    'Chi2': chi2,
+                    'P_value': p_val,
+                    'Significant': p_val < 0.01
+                })
+   
+ 
+    # State level
+    for state in df['State'].unique()[:10]:  # Top 10 states for brevity
+        state_data = df[df['State'] == state]
+        for party in parties:
+            chi2, p_val, obs, exp = benford_law_test(state_data[party], which='first')
+            if chi2 is not None:
+                results.append({
+                    'Level': state,
+                    'Party': party,
+                    'Digit': 'first',
+                    'Chi2': chi2,
+                    'P_value': p_val,
+                    'Significant': p_val < 0.01
+                })
+    
+    results_df = pd.DataFrame(results)
+    # Summary
+    if len(results_df) > 0:
+        violations = results_df['Significant'].sum()
+        total_tests = len(results_df)
+        print(f"Significant Benford violations: {violations}/{total_tests} "
+              f"({violations/total_tests*100:.1f}%)")
+        # Show top violations
+        print("\nTop 5 Benford violations:")
+        print(results_df[results_df['Significant']].nsmallest(5, 'P_value')[
+            ['Level', 'Party', 'Digit', 'Chi2', 'P_value']
+        ])
+    return results_df
+
+def last_digit_analysis(df, parties=['APC', 'LP', 'PDP', 'NNPP']):
+    """Analyze last digit distribution for uniformity"""
+    print("\n" + "="*50)
+    print("LAST DIGIT ANALYSIS")
+    print("="*50)
+    
+    pooled = df[parties].stack()
+    last_digits = extract_digits(pooled, which="last")
+    
+    if len(last_digits) < 100:
+        print("Insufficient data for last digit analysis")
+        return None
+    counts = pd.Series(last_digits).value_counts().reindex(range(10), fill_value=0).sort_index()
+    expected = np.array([len(last_digits) / 10] * 10)
+    
+    chi2, p_val = chisquare(counts.values, expected)
+    
+    print(f"Chi-square test for uniformity: χ²={chi2:.2f}, p={p_val:.4g}")
+    print(f"Result: {'Non-uniform (suspicious)' if p_val < 0.01 else 'Uniform (normal)'}")
+    
+    # Check specific digits
+    for digit in [0, 5]:
+        obs_rate = counts[digit] / len(last_digits)
+        z_score = (obs_rate - 0.1) / np.sqrt(0.1 * 0.9 / len(last_digits))
+        print(f"Digit {digit}: {obs_rate:.3f} (z={z_score:.2f})")
+    
+    return pd.DataFrame({
+        'Digit': range(10),
+        'Count': counts.values,
+        'Expected': expected.astype(int),
+        'Deviation': counts.values - expected
+    })
+
+def turnout_party_correlation(df, party='APC'):
+    """Analyze correlation between turnout and party vote share"""
+    print(f"\n" + "="*50)
+    print(f"TURNOUT-{party} CORRELATION ANALYSIS")
+    print("="*50)
+    
+    # Calculate metrics
+    df_clean = df.copy()
+    df_clean['turnout_rate'] = df_clean['Accredited_Voters'] / df_clean['Registered_Voters']
+    df_clean['vote_total'] = df_clean[['APC', 'LP', 'PDP', 'NNPP']].sum(axis=1)
+    df_clean[f'{party}_share'] = df_clean[party] / df_clean['vote_total']
+    
+    # Remove invalid values
+    df_clean = df_clean.replace([np.inf, -np.inf], np.nan)
+    df_clean = df_clean.dropna(subset=['turnout_rate', f'{party}_share'])
+    
+    # Overall correlation
+    corr, p_val = pearsonr(df_clean['turnout_rate'], df_clean[f'{party}_share'])
+    print(f"Overall correlation: r={corr:.3f}, p={p_val:.6f}")
+    
+    # By turnout quintiles
+    quintiles = pd.qcut(df_clean['turnout_rate'], 5, duplicates='drop')
+    
+    print(f"\nCorrelation by turnout quintile:")
+    for i, (interval, group) in enumerate(df_clean.groupby(quintiles), start=1):
+        if len(group) >= 3:
+            r, p = pearsonr(group['turnout_rate'], group[f'{party}_share'])
+            print(f"  Q{i} [{interval.left:.3f}-{interval.right:.3f}]: "
+                  f"r={r:.3f}, p={p:.4f}, n={len(group)}")
+
+# GEOGRAPHIC ANALYSIS
+def analyze_by_geography(df):
+    """Analyze fraud patterns by geographic location"""
+    print("\n" + "="*50)
+    print("GEOGRAPHIC FRAUD ANALYSIS")
+    print("="*50)
+    
+    # State-level analysis
+    state_analysis = df.groupby('State').agg({
+        'fraud_score': ['mean', 'std', 'max'],
+        'is_anomaly': 'mean',
+        'turnout_rate': 'mean',
+        'vote_concentration': 'mean',
+        'Registered_Voters': 'sum'
+    }).round(4)
+    
+    state_analysis.columns = ['_'.join(col) for col in state_analysis.columns]
+    state_analysis = state_analysis.sort_values('fraud_score_mean', ascending=False)
+    
+    print("Top 10 States by Average Fraud Score:")
+    print(state_analysis.head(10)[['fraud_score_mean', 'is_anomaly_mean', 'turnout_rate_mean']])
+    
+    # LGA-level analysis
+    lga_analysis = df.groupby(['State', 'LGA']).agg({
+        'fraud_score': 'mean',
+        'is_anomaly': 'mean',
+        'turnout_rate': 'mean',
+        'vote_total': 'sum'
+    }).round(4)
+    
+    suspicious_lgas = lga_analysis[lga_analysis['fraud_score'] >= 2.0]
+    print(f"\nLGAs with high fraud scores (≥2.0): {len(suspicious_lgas)}")
+    
+    if len(suspicious_lgas) > 0:
+        print("\nTop 5 most suspicious LGAs:")
+        print(suspicious_lgas.nlargest(5, 'fraud_score')[['fraud_score', 'is_anomaly']])
+    
+    return state_analysis, lga_analysis
+
+def state_anomaly_rates_with_ci(df):
+    """Calculate anomaly rates by state with confidence intervals"""
+    anomaly_by_state = df.groupby('State').agg(
+        Anomalous_units=('is_anomaly', 'sum'),
+        Total_units=('is_anomaly', 'count'),
+        Anomaly_rate=('is_anomaly', 'mean')
+    )
+    
+    # Compute Wilson 95% confidence intervals
+    ci_results = []
+    for _, row in anomaly_by_state.iterrows():
+        lower, upper = proportion_confint(
+            count=row['Anomalous_units'],
+            nobs=row['Total_units'],
+            alpha=0.05,
+            method='wilson'
+        )
+        ci_results.append((lower, upper))
+    
+    anomaly_by_state['lower_CI'], anomaly_by_state['upper_CI'] = zip(*ci_results)
+    
+    return anomaly_by_state.sort_values('Anomaly_rate', ascending=False)
+# COMPETITIVENESS ANALYSIS
+def competitiveness_metrics(votes):
+    """Compute electoral competitiveness metrics"""
+    votes = np.array(votes, dtype=float)
+    total = votes.sum()
+    
+    if total == 0:
+        return dict(ENP=np.nan, HHI=np.nan, Winner_margin_pp=np.nan, 
+                   Top2_share_pp=np.nan, Std_vote_share_pp=np.nan)
+    
+    shares = votes / total
+    shares_sorted = np.sort(shares)[::-1]
+    
+    # Herfindahl-Hirschman Index
+    hhi = np.sum(shares**2)
+    # Effective Number of Parties
+    enp = 1 / hhi if hhi > 0 else np.nan
+    
+    top1 = shares_sorted[0]
+    top2 = shares_sorted[1] if len(shares_sorted) > 1 else 0
+    
+    return dict(
+        ENP=enp,
+        HHI=hhi,
+        Winner_margin_pp=(top1 - top2) * 100,
+        Top2_share_pp=(top1 + top2) * 100,
+        Std_vote_share_pp=np.std(shares) * 100
+    )
+
+def analyze_competitiveness(df):
+    """Comprehensive competitiveness analysis"""
+    print("\n" + "="*50)
+    print("COMPETITIVENESS ANALYSIS")
+    print("="*50)
+    
+    party_cols = ['APC', 'PDP', 'LP', 'NNPP']
+    # National metrics
+    nat_votes = df[party_cols].sum(axis=0)
+    national_metrics = competitiveness_metrics(nat_votes)
+    
+    print("National competitiveness metrics:")
+    for k, v in national_metrics.items():
+        print(f"  {k}: {v:.3f}")
+    
+    # State-level metrics
+    if 'State' in df.columns:
+        state_metrics = df.groupby('State')[party_cols].sum().apply(
+            competitiveness_metrics, axis=1
+        )
+        state_metrics_df = pd.DataFrame(state_metrics.tolist(), index=state_metrics.index)
+     
+        print("\nTop 5 most competitive states (by ENP):")
+        print(state_metrics_df.nlargest(5, 'ENP')[['ENP', 'Winner_margin_pp']])
+        print("\nTop 5 least competitive states (by ENP):")
+        print(state_metrics_df.nsmallest(5, 'ENP')[['ENP', 'Winner_margin_pp']])
+    
+    # Competitiveness vs fraud correlation
+    tbl = df.groupby('Unit_type').agg(
+        Number_of_units=('Unit_type', 'count'),
+        Anomaly_rate=('is_anomaly', 'mean'),
+        Avg_fraud_score=('fraud_score', 'mean')
+    ).round(3)
+    
+    print("\nFraud by competitiveness level:")
+    print(tbl)
+    return national_metrics, state_metrics_df if 'State' in df.columns else None
+
+# VISUALIZATION
+def create_comprehensive_visualizations(df):
+    """Create publication-ready visualizations"""
+    fig, axes = plt.subplots(3, 3, figsize=(20, 18))
+    fig.suptitle('Electoral Fraud Detection in Nigeria 2023 Elections', 
+                 fontsize=16, fontweight='bold')
+    
+    # 1. Fraud Score Distribution
+    axes[0, 0].hist(df['fraud_score'], bins=range(0, 7), alpha=0.7, 
+                   color='skyblue', edgecolor='black')
+    axes[0, 0].set_xlabel('Fraud Score')
+    axes[0, 0].set_ylabel('Number of Polling Units')
+    axes[0, 0].set_title('Distribution of Fraud Scores')
+    axes[0, 0].set_yscale('log')
+    
+    # 2. Turnout Rate Distribution
+    axes[0, 1].hist(df['turnout_rate'], bins=50, alpha=0.7, 
+                   color='lightgreen', edgecolor='black')
+    axes[0, 1].axvline(1.0, color='red', linestyle='--', linewidth=2, label='100% Turnout')
+    axes[0, 1].set_xlabel('Turnout Rate')
+    axes[0, 1].set_ylabel('Number of Polling Units')
+    axes[0, 1].set_title('Turnout Rate Distribution')
+    axes[0, 1].legend()
+    
+    # 3. Party Vote Shares
+    party_totals = df[['APC', 'LP', 'PDP', 'NNPP']].sum()
+    colors = ['red', 'green', 'blue', 'orange']
+    axes[0, 2].pie(party_totals.values, labels=party_totals.index, 
+                  autopct='%1.1f%%', colors=colors)
+    axes[0, 2].set_title('National Vote Share by Party')
+    
+    # 4. Geographic Pattern (Top 15 states by fraud score)
+    top_states = df.groupby('State')['fraud_score'].mean().nlargest(15)
+    axes[1, 0].barh(range(len(top_states)), top_states.values, color='coral')
+    axes[1, 0].set_yticks(range(len(top_states)))
+    axes[1, 0].set_yticklabels(top_states.index, fontsize=8)
+    axes[1, 0].set_xlabel('Average Fraud Score')
+    axes[1, 0].set_title('Top 15 States by Fraud Score')
+    
+    # 5. Scatter: Turnout vs Vote Concentration
+    scatter = axes[1, 1].scatter(df['turnout_rate'], df['vote_concentration'], 
+                                c=df['fraud_score'], cmap='Reds', alpha=0.6, s=1)
+    axes[1, 1].set_xlabel('Turnout Rate')
+    axes[1, 1].set_ylabel('Vote Concentration')
+    axes[1, 1].set_title('Turnout vs Vote Concentration\n(Color = Fraud Score)')
+    plt.colorbar(scatter, ax=axes[1, 1])
+    
+    # 6. Anomaly Detection Results
+    if 'is_anomaly' in df.columns:
+        anomaly_counts = df.groupby('State')['is_anomaly'].mean().nlargest(15)
+        axes[1, 2].barh(range(len(anomaly_counts)), anomaly_counts.values * 100, 
+                       color='purple')
+        axes[1, 2].set_yticks(range(len(anomaly_counts)))
+        axes[1, 2].set_yticklabels(anomaly_counts.index, fontsize=8)
+        axes[1, 2].set_xlabel('Anomaly Rate (%)')
+        axes[1, 2].set_title('ML Anomaly Detection by State')
+    
+    # 7. Fraud indicators correlation
+    fraud_features = ['turnout_rate', 'vote_concentration', 'impossible_turnout',
+                     'over_voting', 'perfect_candidate', 'zero_competition']
+    correlation_matrix = df[fraud_features].corr()
+    sns.heatmap(correlation_matrix, annot=True, fmt='.2f', cmap='coolwarm',
+               center=0, ax=axes[2, 0])
+    axes[2, 0].set_title('Fraud Indicators Correlation')
+    
+    # 8. Competitiveness distribution
+    if 'Unit_type' in df.columns:
+        unit_counts = df['Unit_type'].value_counts()
+        axes[2, 1].bar(range(len(unit_counts)), unit_counts.values)
+        axes[2, 1].set_xticks(range(len(unit_counts)))
+        axes[2, 1].set_xticklabels(unit_counts.index, rotation=45)
+        axes[2, 1].set_ylabel('Number of Polling Units')
+        axes[2, 1].set_title('Distribution by Competitiveness')
+    
+    # 9. Benford's Law visualization (first digits)
+    all_votes = df[['APC', 'LP', 'PDP', 'NNPP']].values.flatten()
+    first_digits = extract_digits(pd.Series(all_votes[all_votes > 0]), which='first')
+    if len(first_digits) > 0:
+        digit_counts = pd.Series(first_digits).value_counts().reindex(range(1, 10), fill_value=0)
+        benford_expected = [np.log10(1 + 1/d) * len(first_digits) for d in range(1, 10)]
+        
+        x = np.arange(1, 10)
+        width = 0.35
+        axes[2, 2].bar(x - width/2, digit_counts.values, width, label='Observed', alpha=0.7)
+        axes[2, 2].bar(x + width/2, benford_expected, width, label='Benford Expected', alpha=0.7)
+        axes[2, 2].set_xlabel('First Digit')
+        axes[2, 2].set_ylabel('Frequency')
+        axes[2, 2].set_title("Benford's Law Test")
+        axes[2, 2].legend()
+    
+    plt.tight_layout()
+    plt.savefig('comprehensive_fraud_analysis.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+
+# MODEL VALIDATION
+def validate_fraud_detection(df):
+    """Validate fraud detection approach using cross-validation"""
+    print("\n" + "="*50)
+    print("MODEL VALIDATION")
+    print("="*50)
+    
+    # Geographic cross-validation
+    major_states = df['State'].value_counts().head(5).index
+    validation_results = []
+    
+    ml_features = ['turnout_rate', 'vote_concentration', 'fraud_score']
+    
+    for test_state in major_states:
+        train_data = df[df['State'] != test_state]
+        test_data = df[df['State'] == test_state]
+        
+        if len(test_data) > 100:
+            X_train = train_data[ml_features].fillna(0)
+            X_test = test_data[ml_features].fillna(0)
+            
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_test_scaled = scaler.transform(X_test)
+            
+            # Fit isolation forest
+            iso_forest = IsolationForest(contamination=0.05, random_state=42)
+            iso_forest.fit(X_train_scaled)
+            
+            # Test on held-out state
+            test_anomalies = iso_forest.predict(X_test_scaled)
+            anomaly_rate = (test_anomalies == -1).mean()
+            
+            validation_results.append({
+                'test_state': test_state,
+                'anomaly_rate': anomaly_rate,
+                'test_samples': len(test_data)
+            })
+    
+    print("Geographic Cross-Validation Results:")
+    for result in validation_results:
+        print(f"  {result['test_state']}: {result['anomaly_rate']:.3f} anomaly rate "
+              f"({result['test_samples']:,} units)")
+    # Clustering validation
+    X = df[ml_features].fillna(0)
+    X_scaled = StandardScaler().fit_transform(X)
+    
+    silhouette_scores = []
+    for n_clusters in range(2, 6):
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        cluster_labels = kmeans.fit_predict(X_scaled)
+        silhouette_avg = silhouette_score(X_scaled, cluster_labels, sample_size=min(5000, len(X)))
+        silhouette_scores.append(silhouette_avg)
+    
+    optimal_clusters = np.argmax(silhouette_scores) + 2
+    print(f"\nClustering Validation:")
+    print(f"  Optimal number of clusters: {optimal_clusters}")
+    print(f"  Best silhouette score: {max(silhouette_scores):.3f}")
+    
+    return validation_results, silhouette_scores
+
+# SUMMARY REPORTS
+def generate_fraud_summary(df):
+    """Generate comprehensive fraud detection summary"""
+    print("\n" + "="*50)
+    print("FRAUD DETECTION SUMMARY REPORT")
+    print("="*50)
+    
+    total_units = len(df)
+    total_votes = df['vote_total'].sum()
+    
+    # Overall fraud statistics
+    print(f"\nTotal Polling Units: {total_units:,}")
+    print(f"Total Votes Cast: {total_votes:,}")
+    
+    # Fraud indicators
+    fraud_stats = {
+        'Impossible Turnout (>105%)': df['impossible_turnout'].sum(),
+        'Over-voting': df['over_voting'].sum(),
+        'Perfect Candidate (>98% concentration)': df['perfect_candidate'].sum(),
+        'Zero Competition': df['zero_competition'].sum(),
+        'Suspicious Round Numbers': df['suspicious_rounds'].sum()
+    }
+    print("\nFraud Indicators Detected:")
+    for indicator, count in fraud_stats.items():
+        pct = count / total_units * 100
+        print(f"  {indicator}: {count:,} units ({pct:.2f}%)")
+    # Fraud score distribution
+    fraud_dist = df['fraud_score'].value_counts().sort_index()
+    print("\nFraud Score Distribution:")
+    for score, count in fraud_dist.items():
+        pct = count / total_units * 100
+        print(f"  Score {score}: {count:,} units ({pct:.2f}%)")
+    
+    # ML anomaly detection
+    if 'is_anomaly' in df.columns:
+        anomaly_count = df['is_anomaly'].sum()
+        print(f"\nML Anomaly Detection:")
+        print(f"  Anomalous units: {anomaly_count:,} ({anomaly_count/total_units*100:.2f}%)")
+        
+        # Correlation between manual and ML
+        corr, _ = spearmanr(df['fraud_score'], df['is_anomaly'])
+        print(f"  Correlation with fraud score: {corr:.3f}")
+    
+    # Geographic concentration
+    top_fraud_states = df.groupby('State')['fraud_score'].mean().nlargest(5)
+    print("\nTop 5 States by Average Fraud Score:")
+    for state, score in top_fraud_states.items():
+        print(f"  {state}: {score:.3f}")
+    
+    # Impact assessment
+    print("\nImpact Assessment (votes in suspicious units):")
+    scenarios = {
+        "Conservative (fraud_score ≥ 3)": df['fraud_score'] >= 3,
+        "Moderate (fraud_score ≥ 2)": df['fraud_score'] >= 2,
+        "Aggressive (fraud_score ≥ 1)": df['fraud_score'] >= 1
+    }
+    
+    for label, mask in scenarios.items():
+        affected_units = df[mask]
+        affected_votes = affected_units['vote_total'].sum()
+        pct_votes = affected_votes / total_votes * 100 if total_votes > 0 else 0
+        print(f"  {label}: {affected_votes:,} votes ({pct_votes:.2f}% of total)")
+
+def export_results_to_excel(df, state_analysis, lga_analysis, filename='fraud_analysis_results.xlsx'):
+    """Export all results to Excel file"""
+    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+        # Main dataset with fraud scores
+        df.to_excel(writer, sheet_name='Full_Data', index=False)
+        
+        # State analysis
+        if state_analysis is not None:
+            state_analysis.to_excel(writer, sheet_name='State_Analysis')
+        
+        # LGA analysis
+        if lga_analysis is not None:
+            lga_analysis.to_excel(writer, sheet_name='LGA_Analysis')
+        
+        # Summary statistics
+        summary_stats = pd.DataFrame({
+            'Metric': ['Total Units', 'Total Votes', 'Avg Fraud Score', 
+                      'Anomaly Rate', 'Avg Turnout'],
+            'Value': [len(df), df['vote_total'].sum(), df['fraud_score'].mean(),
+                     df['is_anomaly'].mean() if 'is_anomaly' in df.columns else 0,
+                     df['turnout_rate'].mean()]
+        })
+        summary_stats.to_excel(writer, sheet_name='Summary', index=False)
+    
+    print(f"\nResults exported to {filename}")
+
+# MAIN ANALYSIS PIPELINE
+def run_complete_analysis(filepath='Combined_election_verified.csv', 
+                         export_excel=True, create_plots=True):
+    """Run the complete fraud detection analysis pipeline"""
+    
+    print("="*60)
+    print("NIGERIAN ELECTION FRAUD DETECTION ANALYSIS")
+    print("2023 Presidential Elections")
+    print("="*60)
+    
+    # Load and prepare data
+    df = load_and_prepare_data(filepath)
+    print_data_overview(df)
+    
+    # Feature engineering
+    df = create_fraud_features(df)
+    print("\nFeature engineering completed")
+    
+    # Machine learning anomaly detection
+    df, models, scaler, ml_results = detect_anomalies_ml(df)
+    
+    # Statistical tests
+    benford_results = perform_benford_analysis(df)
+    last_digit_results = last_digit_analysis(df)
+    turnout_party_correlation(df, party='APC')
+    
+    # Geographic analysis
+    state_analysis, lga_analysis = analyze_by_geography(df)
+    anomaly_rates = state_anomaly_rates_with_ci(df)
+    
+    # Competitiveness analysis
+    national_comp, state_comp = analyze_competitiveness(df)
+    
+    # Validation
+    validation_results, silhouette_scores = validate_fraud_detection(df)
+    
+    # Generate summary report
+    generate_fraud_summary(df)
+    
+    # Create visualizations
+    if create_plots:
+        create_comprehensive_visualizations(df)
+    
+    # Export to Excel
+    if export_excel:
+        export_results_to_excel(df, state_analysis, lga_analysis)
+    
+    print("\n" + "="*60)
+    print("ANALYSIS COMPLETE")
+    print("="*60)
+    
+    return {
+        'dataframe': df,
+        'models': models,
+        'scaler': scaler,
+        'state_analysis': state_analysis,
+        'lga_analysis': lga_analysis,
+        'ml_results': ml_results,
+        'benford_results': benford_results,
+        'validation_results': validation_results
+    }
+
+# EXECUTION
+if __name__ == "__main__":
+    # Run the complete analysis
+    results = run_complete_analysis(
+        filepath='Combined_election_verified.csv',
+        export_excel=True,
+        create_plots=True
+    )
+    
+    print("\nAnalysis completed successfully!")
+    print(f"Processed {len(results['dataframe']):,} polling units")
+    print(f"Detected {results['dataframe']['is_anomaly'].sum():,} anomalous units")
+    print("\nResults saved to:")
+    print("  - comprehensive_fraud_analysis.png (visualizations)")
+    print("  - fraud_analysis_results.xlsx (detailed results)"
+    print("\nMain dataframe available in: results['dataframe']")
