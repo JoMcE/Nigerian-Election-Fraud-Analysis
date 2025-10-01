@@ -1,4 +1,4 @@
-# IMPORTS
+#IMPORTS
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -7,6 +7,7 @@ from scipy.stats import (chisquare, pearsonr, spearmanr, kruskal, f_oneway,
                          chi2_contingency)
 from scipy.spatial.distance import pdist, squareform
 from statsmodels.stats.proportion import proportion_confint
+
 from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.svm import OneClassSVM
 from sklearn.preprocessing import StandardScaler
@@ -15,26 +16,31 @@ from sklearn.metrics import (precision_score, recall_score, f1_score,
                            average_precision_score, silhouette_score)
 from sklearn.cluster import KMeans
 from sklearn.feature_selection import mutual_info_regression
+
 # Set display options
 np.set_printoptions(precision=4, suppress=True)
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', None)
 
 # DATA LOADING AND INITIAL SETUP
+
 def load_and_prepare_data(filepath='Combined_election_verified.csv'):
     """Load and perform initial data preparation"""
     df = pd.read_csv(filepath)
     print(f"Dataset loaded: {df.shape[0]:,} polling units, {df.shape[1]} columns")
+    
     # Ensure party columns are numeric
     party_cols = ['APC', 'LP', 'PDP', 'NNPP']
     for col in party_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    
     # Ensure other numeric columns
     numeric_cols = ['Registered_Voters', 'Accredited_Voters', 'Transcription_Count', 
                    'Results_Found']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
+    
     # Convert boolean flags to 0/1
     flag_cols = ['Result_Sheet_Stamped', 'Result_Sheet_Corrected', 
                 'Result_Sheet_Invalid', 'Result_Sheet_Unclear', 'Result_Sheet_Unsigned']
@@ -44,6 +50,7 @@ def load_and_prepare_data(filepath='Combined_election_verified.csv'):
             return np.nan
         s = str(x).strip().lower()
         return 1 if s in {'1', 'true', 't', 'yes', 'y'} else 0
+    
     for col in flag_cols:
         if col in df.columns:
             df[col] = df[col].apply(to_binary).fillna(0).astype(int)
@@ -67,9 +74,11 @@ def print_data_overview(df):
         print(f"  {party}: {votes:,} votes ({votes/party_totals.sum()*100:.1f}%)")
 
 # FEATURE ENGINEERING
+
 def create_fraud_features(df):
     """Create comprehensive fraud detection features"""
     df = df.copy()
+    
     # Basic calculations
     df['turnout_rate'] = df['Accredited_Voters'] / df['Registered_Voters'].replace(0, np.nan)
     df['vote_total'] = df[['APC', 'LP', 'PDP', 'NNPP']].sum(axis=1)
@@ -77,13 +86,13 @@ def create_fraud_features(df):
     df['vote_concentration'] = df['winner_votes'] / (df['vote_total'] + 1)
     df['winner_share'] = (df['winner_votes'] / df['vote_total']) * 100
     
-
     # Fraud indicators
     df['impossible_turnout'] = (df['turnout_rate'] > 1.05).astype(int)
     df['over_voting'] = (df['vote_total'] > df['Accredited_Voters']).astype(int)
     df['perfect_candidate'] = ((df['vote_concentration'] > 0.98) & 
                               (df['vote_total'] > 10)).astype(int)
     df['zero_competition'] = ((df[['APC', 'LP', 'PDP', 'NNPP']] == 0).sum(axis=1) >= 3).astype(int)
+    
     # Round number bias (psychological indicator of manipulation)
     round_counts = []
     for party in ['APC', 'LP', 'PDP', 'NNPP']:
@@ -107,8 +116,9 @@ def create_fraud_features(df):
     return df
 
 # MACHINE LEARNING ANOMALY DETECTION
-def detect_anomalies_ml(df, contamination=0.05):
-    """Use multiple ML models for anomaly detection"""
+
+def detect_anomalies_ml_enhanced(df, contamination=0.05):
+    """Enhanced ML anomaly detection with ensemble and AUC-PR metrics"""
     ml_features = [
         'turnout_rate', 'vote_concentration', 'impossible_turnout',
         'over_voting', 'perfect_candidate', 'zero_competition', 'suspicious_rounds'
@@ -117,6 +127,7 @@ def detect_anomalies_ml(df, contamination=0.05):
     # Prepare data
     X = df[ml_features].fillna(0)
     X = X.replace([np.inf, -np.inf], 0)
+    
     # Scale features
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
@@ -133,48 +144,84 @@ def detect_anomalies_ml(df, contamination=0.05):
             n_jobs=-1
         ),
         "One-Class SVM": OneClassSVM(kernel="rbf", gamma="scale", nu=contamination),
-        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42)
+        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
     }
     
     results = []
     predictions = {}
+    probabilities = {}
     
-    print("\n" + "="*50)
-    print("MACHINE LEARNING ANOMALY DETECTION")
-    print("="*50)
+    print("\n" + "="*80)
+    print("ENHANCED MACHINE LEARNING ANOMALY DETECTION")
+    print("="*80)
     
     for name, model in models.items():
         if name == "Random Forest":
             model.fit(X, y_pseudo)
             preds = model.predict(X)
+            # Get probability scores for AUC-PR
+            probs = model.predict_proba(X)[:, 1]
         else:
             preds = model.fit_predict(X_scaled)
             preds = (preds == -1).astype(int)
+            # For unsupervised methods, use decision function as probability proxy
+            if name == "Isolation Forest":
+                # Convert decision function to probability-like scores
+                scores = model.decision_function(X_scaled)
+                probs = 1 / (1 + np.exp(scores))  # Sigmoid transformation
+            else:  # One-Class SVM
+                scores = model.decision_function(X_scaled)
+                probs = 1 / (1 + np.exp(-scores))
         
         predictions[name] = preds
+        probabilities[name] = probs
         
         # Evaluate
         prec = precision_score(y_pseudo, preds, zero_division=0)
         rec = recall_score(y_pseudo, preds, zero_division=0)
         f1 = f1_score(y_pseudo, preds, zero_division=0)
+        auc_pr = average_precision_score(y_pseudo, probs)
         
-        results.append([name, prec, rec, f1])
-        print(f"{name}: Precision={prec:.3f}, Recall={rec:.3f}, F1={f1:.3f}")
+        results.append([name, prec, rec, f1, auc_pr])
     
     # Ensemble (majority vote)
     ensemble_preds = ((predictions["Isolation Forest"] + 
                       predictions["One-Class SVM"] + 
                       predictions["Random Forest"]) >= 2).astype(int)
     
+    # Ensemble probabilities (average)
+    ensemble_probs = (probabilities["Isolation Forest"] + 
+                     probabilities["One-Class SVM"] + 
+                     probabilities["Random Forest"]) / 3
+    
+    # Evaluate ensemble
+    prec = precision_score(y_pseudo, ensemble_preds, zero_division=0)
+    rec = recall_score(y_pseudo, ensemble_preds, zero_division=0)
+    f1 = f1_score(y_pseudo, ensemble_preds, zero_division=0)
+    auc_pr = average_precision_score(y_pseudo, ensemble_probs)
+    
+    results.append(["Ensemble (Majority Vote)", prec, rec, f1, auc_pr])
+    
+    # Add to dataframe
     df['is_anomaly'] = ensemble_preds
+    df['anomaly_probability'] = ensemble_probs
     df['anomaly_score'] = models["Isolation Forest"].decision_function(X_scaled)
+    
+    # Display results table
+    results_df = pd.DataFrame(results, 
+                             columns=["Model", "Precision", "Recall", "F1", "AUC-PR"])
+    
+    print("\nModel Performance Comparison:")
+    print("-"*60)
+    print(results_df.to_string(index=False, float_format=lambda x: f'{x:.4f}'))
     
     print(f"\nEnsemble anomalies detected: {ensemble_preds.sum():,} "
           f"({ensemble_preds.mean()*100:.2f}%)")
     
-    return df, models, scaler, pd.DataFrame(results, 
-                                            columns=["Model", "Precision", "Recall", "F1"])
+    return df, models, scaler, results_df
+
 # STATISTICAL TESTS
+
 def extract_digits(series, which="first"):
     """Extract first, second, or last digits from a series"""
     x = series.dropna().astype(int)
@@ -219,63 +266,120 @@ def benford_law_test(vote_series, which="first", alpha=0.01):
     if np.any(expected <= 0):
         return None, None, None, None
     
-
     try:
         chi2_stat, p_value = chisquare(observed, expected)
         return chi2_stat, p_value, observed, expected
     except Exception:
         return None, None, None, None
 
-def perform_benford_analysis(df, parties=['APC', 'LP', 'PDP', 'NNPP']):
-    """Comprehensive Benford's Law analysis"""
-    print("\n" + "="*50)
-    print("BENFORD'S LAW ANALYSIS")
-    print("="*50)
+def perform_comprehensive_benford_analysis(df, parties=['APC', 'LP', 'PDP', 'NNPP']):
+    """Comprehensive Benford's Law analysis including second digit and pooled analysis"""
+    print("\n" + "="*80)
+    print("COMPREHENSIVE BENFORD'S LAW ANALYSIS")
+    print("="*80)
     
     results = []
     
-    # National level
+    # 1. NATIONAL POOLED ANALYSIS (all parties combined)
+    print("\n1. NATIONAL POOLED ANALYSIS (All Parties Combined)")
+    print("-"*50)
+    
+    pooled_votes = df[parties].stack().dropna()
+    pooled_votes = pooled_votes[pooled_votes > 0]
+    
+    for digit_type in ['first', 'second']:
+        chi2, p_val, obs, exp = benford_law_test(pooled_votes, which=digit_type)
+        if chi2 is not None:
+            # Calculate z-scores for each digit
+            z_scores = (obs - exp) / np.sqrt(exp + 1e-10)
+            max_z = np.max(np.abs(z_scores))
+            max_z_digit = np.argmax(np.abs(z_scores))
+            
+            print(f"\n{digit_type.capitalize()} Digit Analysis (Pooled):")
+            print(f"  Sample size: {len(pooled_votes):,}")
+            print(f"  Chi-square: {chi2:.2f}")
+            print(f"  P-value: {p_val:.6f}")
+            print(f"  Significant deviation: {'YES' if p_val < 0.01 else 'NO'}")
+            print(f"  Max Z-score: {max_z:.2f} (digit {max_z_digit + (1 if digit_type=='first' else 0)})")
+            
+            results.append({
+                'Level': 'NATIONAL_POOLED',
+                'Party': 'ALL',
+                'Digit': digit_type,
+                'Chi2': chi2,
+                'P_value': p_val,
+                'Max_Z': max_z,
+                'Significant': p_val < 0.01,
+                'Sample_Size': len(pooled_votes)
+            })
+    
+    # 2. NATIONAL PER-PARTY ANALYSIS
+    print("\n2. NATIONAL PER-PARTY ANALYSIS")
+    print("-"*50)
+    
     for party in parties:
+        party_votes = df[party][df[party] > 0]
         for digit_type in ['first', 'second']:
-            chi2, p_val, obs, exp = benford_law_test(df[party], which=digit_type)
+            chi2, p_val, obs, exp = benford_law_test(party_votes, which=digit_type)
             if chi2 is not None:
+                z_scores = (obs - exp) / np.sqrt(exp + 1e-10)
+                max_z = np.max(np.abs(z_scores))
+                
                 results.append({
                     'Level': 'National',
                     'Party': party,
                     'Digit': digit_type,
                     'Chi2': chi2,
                     'P_value': p_val,
-                    'Significant': p_val < 0.01
-                })
-   
- 
-    # State level
-    for state in df['State'].unique()[:10]:  # Top 10 states for brevity
-        state_data = df[df['State'] == state]
-        for party in parties:
-            chi2, p_val, obs, exp = benford_law_test(state_data[party], which='first')
-            if chi2 is not None:
-                results.append({
-                    'Level': state,
-                    'Party': party,
-                    'Digit': 'first',
-                    'Chi2': chi2,
-                    'P_value': p_val,
-                    'Significant': p_val < 0.01
+                    'Max_Z': max_z,
+                    'Significant': p_val < 0.01,
+                    'Sample_Size': len(party_votes)
                 })
     
+    # 3. STATE-LEVEL ANALYSIS (top states by sample size)
+    print("\n3. STATE-LEVEL SECOND DIGIT ANALYSIS")
+    print("-"*50)
+    
+    top_states = df['State'].value_counts().head(10).index
+    
+    for state in top_states:
+        state_data = df[df['State'] == state]
+        for party in parties:
+            party_votes = state_data[party][state_data[party] > 0]
+            if len(party_votes) >= 50:
+                chi2, p_val, obs, exp = benford_law_test(party_votes, which='second')
+                if chi2 is not None:
+                    z_scores = (obs - exp) / np.sqrt(exp + 1e-10)
+                    max_z = np.max(np.abs(z_scores))
+                    
+                    results.append({
+                        'Level': state,
+                        'Party': party,
+                        'Digit': 'second',
+                        'Chi2': chi2,
+                        'P_value': p_val,
+                        'Max_Z': max_z,
+                        'Significant': p_val < 0.01,
+                        'Sample_Size': len(party_votes)
+                    })
+    
     results_df = pd.DataFrame(results)
+    
     # Summary
     if len(results_df) > 0:
+        print("\n4. SUMMARY OF VIOLATIONS")
+        print("-"*50)
         violations = results_df['Significant'].sum()
         total_tests = len(results_df)
-        print(f"Significant Benford violations: {violations}/{total_tests} "
-              f"({violations/total_tests*100:.1f}%)")
-        # Show top violations
-        print("\nTop 5 Benford violations:")
-        print(results_df[results_df['Significant']].nsmallest(5, 'P_value')[
-            ['Level', 'Party', 'Digit', 'Chi2', 'P_value']
-        ])
+        print(f"Total tests performed: {total_tests}")
+        print(f"Significant Benford violations (p<0.01): {violations} ({violations/total_tests*100:.1f}%)")
+        
+        # Show most significant violations
+        print("\nTop 10 Most Significant Benford Violations:")
+        print(results_df[results_df['Significant']].nsmallest(10, 'P_value')[
+            ['Level', 'Party', 'Digit', 'Chi2', 'P_value', 'Max_Z', 'Sample_Size']
+        ].to_string(index=False))
+    
     return results_df
 
 def last_digit_analysis(df, parties=['APC', 'LP', 'PDP', 'NNPP']):
@@ -290,6 +394,7 @@ def last_digit_analysis(df, parties=['APC', 'LP', 'PDP', 'NNPP']):
     if len(last_digits) < 100:
         print("Insufficient data for last digit analysis")
         return None
+    
     counts = pd.Series(last_digits).value_counts().reindex(range(10), fill_value=0).sort_index()
     expected = np.array([len(last_digits) / 10] * 10)
     
@@ -310,6 +415,80 @@ def last_digit_analysis(df, parties=['APC', 'LP', 'PDP', 'NNPP']):
         'Expected': expected.astype(int),
         'Deviation': counts.values - expected
     })
+
+def forensic_indicators_correlation_matrix(df):
+    """Create and display correlation matrix of key forensic indicators"""
+    print("\n" + "="*80)
+    print("FORENSIC INDICATORS CORRELATION MATRIX")
+    print("="*80)
+    
+    # Select forensic indicators
+    indicators = ['turnout_rate', 'vote_concentration', 'fraud_score', 'over_voting']
+    
+    # Create clean dataset
+    df_clean = df[indicators].replace([np.inf, -np.inf], np.nan).dropna()
+    
+    # Calculate correlation matrix
+    corr_matrix = df_clean.corr(method='pearson')
+    
+    # Calculate z-scores for correlations
+    n = len(df_clean)
+    z_scores = np.arctanh(corr_matrix) * np.sqrt(n - 3)
+    
+    print("\n1. PEARSON CORRELATION MATRIX")
+    print("-"*40)
+    print(corr_matrix.round(3).to_string())
+    
+    print("\n2. Z-SCORES FOR CORRELATIONS")
+    print("-"*40)
+    print(z_scores.round(2).to_string())
+    
+    print("\n3. SIGNIFICANCE LEVELS")
+    print("-"*40)
+    # Calculate p-values for each correlation
+    from scipy.stats import norm
+    p_values = 2 * (1 - norm.cdf(np.abs(z_scores)))
+    p_values_df = pd.DataFrame(p_values, index=indicators, columns=indicators)
+    
+    sig_matrix = pd.DataFrame(index=indicators, columns=indicators)
+    for i in indicators:
+        for j in indicators:
+            if i != j:
+                p = p_values_df.loc[i, j]
+                if p < 0.001:
+                    sig_matrix.loc[i, j] = '***'
+                elif p < 0.01:
+                    sig_matrix.loc[i, j] = '**'
+                elif p < 0.05:
+                    sig_matrix.loc[i, j] = '*'
+                else:
+                    sig_matrix.loc[i, j] = 'ns'
+            else:
+                sig_matrix.loc[i, j] = '-'
+    
+    print(sig_matrix.to_string())
+    print("\nSignificance: *** p<0.001, ** p<0.01, * p<0.05, ns = not significant")
+    
+    # Create visualization
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # Correlation heatmap
+    sns.heatmap(corr_matrix, annot=True, fmt='.3f', cmap='coolwarm', 
+                center=0, square=True, ax=ax1,
+                cbar_kws={"shrink": .8})
+    ax1.set_title('Forensic Indicators Correlation Matrix')
+    
+    # Z-score heatmap
+    sns.heatmap(z_scores, annot=True, fmt='.1f', cmap='RdBu_r',
+                center=0, square=True, ax=ax2,
+                cbar_kws={"shrink": .8})
+    ax2.set_title('Z-scores for Correlations')
+    
+    plt.tight_layout()
+    plt.savefig('forensic_correlation_matrix.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    return corr_matrix, z_scores
 
 def turnout_party_correlation(df, party='APC'):
     """Analyze correlation between turnout and party vote share"""
@@ -341,7 +520,253 @@ def turnout_party_correlation(df, party='APC'):
             print(f"  Q{i} [{interval.left:.3f}-{interval.right:.3f}]: "
                   f"r={r:.3f}, p={p:.4f}, n={len(group)}")
 
+def turnout_fraud_correlation_analysis(df):
+    """Analyze correlation between turnout rates and fraud indicators"""
+    print("\n" + "="*80)
+    print("TURNOUT vs FRAUD/ANOMALY CORRELATION ANALYSIS")
+    print("="*80)
+    
+    # Ensure we have clean data
+    df_clean = df.copy()
+    df_clean = df_clean.dropna(subset=['turnout_rate', 'fraud_score'])
+    
+    if 'is_anomaly' not in df_clean.columns:
+        print("Warning: is_anomaly column not found. Run ML anomaly detection first.")
+        df_clean['is_anomaly'] = (df_clean['fraud_score'] >= 2).astype(int)
+    
+    # 1. Overall correlations
+    print("\n1. OVERALL CORRELATIONS")
+    print("-"*40)
+    
+    # Pearson correlation
+    pearson_fraud, p_fraud = pearsonr(df_clean['turnout_rate'], df_clean['fraud_score'])
+    pearson_anomaly, p_anomaly = pearsonr(df_clean['turnout_rate'], df_clean['is_anomaly'])
+    
+    # Spearman correlation (for non-linear relationships)
+    spearman_fraud, sp_fraud = spearmanr(df_clean['turnout_rate'], df_clean['fraud_score'])
+    spearman_anomaly, sp_anomaly = spearmanr(df_clean['turnout_rate'], df_clean['is_anomaly'])
+    
+    print(f"Turnout vs Fraud Score:")
+    print(f"  Pearson r = {pearson_fraud:.4f} (p = {p_fraud:.6f})")
+    print(f"  Spearman ρ = {spearman_fraud:.4f} (p = {sp_fraud:.6f})")
+    
+    print(f"\nTurnout vs Anomaly (0/1):")
+    print(f"  Pearson r = {pearson_anomaly:.4f} (p = {p_anomaly:.6f})")
+    print(f"  Spearman ρ = {spearman_anomaly:.4f} (p = {sp_anomaly:.6f})")
+    
+    # 2. Correlation by turnout ranges
+    print("\n2. FRAUD METRICS BY TURNOUT RANGE")
+    print("-"*40)
+    
+    # Define turnout ranges
+    turnout_ranges = [
+        (0, 0.2, "Very Low (0-20%)"),
+        (0.2, 0.4, "Low (20-40%)"),
+        (0.4, 0.6, "Moderate (40-60%)"),
+        (0.6, 0.8, "High (60-80%)"),
+        (0.8, 1.0, "Very High (80-100%)"),
+        (1.0, float('inf'), "Impossible (>100%)")
+    ]
+    
+    print(f"{'Turnout Range':<25} {'Units':<10} {'Avg Fraud Score':<15} {'Anomaly Rate':<15} {'Correlation':<15}")
+    print("-"*80)
+    
+    for low, high, label in turnout_ranges:
+        mask = (df_clean['turnout_rate'] >= low) & (df_clean['turnout_rate'] < high)
+        subset = df_clean[mask]
+        
+        if len(subset) > 0:
+            avg_fraud = subset['fraud_score'].mean()
+            anomaly_rate = subset['is_anomaly'].mean()
+            
+            # Correlation within this range
+            if len(subset) > 10:  # Need enough points for correlation
+                corr, _ = pearsonr(subset['turnout_rate'], subset['fraud_score'])
+            else:
+                corr = np.nan
+            
+            print(f"{label:<25} {len(subset):<10} {avg_fraud:<15.3f} {anomaly_rate*100:<14.1f}% "
+                  f"{corr:<15.3f}" if not np.isnan(corr) else f"{label:<25} {len(subset):<10} {avg_fraud:<15.3f} {anomaly_rate*100:<14.1f}% {'N/A':<15}")
+    
+    # 3. Turnout quintile analysis
+    print("\n3. FRAUD METRICS BY TURNOUT QUINTILES")
+    print("-"*40)
+    
+    try:
+        df_clean['turnout_quintile'] = pd.qcut(df_clean['turnout_rate'], 5, 
+                                               labels=['Q1 (Lowest)', 'Q2', 'Q3', 'Q4', 'Q5 (Highest)'],
+                                               duplicates='drop')
+        
+        quintile_stats = df_clean.groupby('turnout_quintile').agg({
+            'turnout_rate': ['min', 'max', 'mean'],
+            'fraud_score': 'mean',
+            'is_anomaly': 'mean',
+            'Unit_type': 'count'  # for sample size
+        }).round(3)
+        
+        print(f"{'Quintile':<15} {'Turnout Range':<20} {'Avg Turnout':<12} {'Avg Fraud':<12} {'Anomaly %':<12} {'N':<8}")
+        print("-"*80)
+        
+        for quintile in quintile_stats.index:
+            row = quintile_stats.loc[quintile]
+            range_str = f"{row[('turnout_rate', 'min')]:.2f}-{row[('turnout_rate', 'max')]:.2f}"
+            print(f"{quintile:<15} {range_str:<20} {row[('turnout_rate', 'mean')]:<12.3f} "
+                  f"{row[('fraud_score', 'mean')]:<12.3f} {row[('is_anomaly', 'mean')]*100:<11.1f}% "
+                  f"{int(row[('Unit_type', 'count')]):<8}")
+    except Exception as e:
+        print(f"Could not perform quintile analysis: {e}")
+    
+    # 4. State-level turnout-fraud correlation
+    print("\n4. STATE-LEVEL TURNOUT-FRAUD CORRELATIONS")
+    print("-"*40)
+    
+    state_correlations = []
+    for state in df_clean['State'].unique():
+        state_data = df_clean[df_clean['State'] == state]
+        if len(state_data) >= 20:  # Need minimum sample size
+            corr, p_val = pearsonr(state_data['turnout_rate'], state_data['fraud_score'])
+            state_correlations.append({
+                'State': state,
+                'Correlation': corr,
+                'P_value': p_val,
+                'N': len(state_data),
+                'Avg_Turnout': state_data['turnout_rate'].mean(),
+                'Avg_Fraud': state_data['fraud_score'].mean()
+            })
+    
+    state_corr_df = pd.DataFrame(state_correlations).sort_values('Correlation', ascending=False)
+    
+    print("Top 10 States with Highest Turnout-Fraud Correlation:")
+    print(f"{'State':<20} {'Correlation':<12} {'P-value':<12} {'Avg Turnout':<12} {'Avg Fraud':<12} {'N':<8}")
+    print("-"*80)
+    
+    for _, row in state_corr_df.head(10).iterrows():
+        sig = "***" if row['P_value'] < 0.001 else "**" if row['P_value'] < 0.01 else "*" if row['P_value'] < 0.05 else ""
+        print(f"{row['State']:<20} {row['Correlation']:<11.3f}{sig} {row['P_value']:<12.4f} "
+              f"{row['Avg_Turnout']:<12.3f} {row['Avg_Fraud']:<12.3f} {int(row['N']):<8}")
+    
+    print("\nBottom 10 States with Lowest (or Negative) Turnout-Fraud Correlation:")
+    for _, row in state_corr_df.tail(10).iterrows():
+        sig = "***" if row['P_value'] < 0.001 else "**" if row['P_value'] < 0.01 else "*" if row['P_value'] < 0.05 else ""
+        print(f"{row['State']:<20} {row['Correlation']:<11.3f}{sig} {row['P_value']:<12.4f} "
+              f"{row['Avg_Turnout']:<12.3f} {row['Avg_Fraud']:<12.3f} {int(row['N']):<8}")
+    
+    # 5. Statistical summary
+    print("\n5. STATISTICAL SUMMARY")
+    print("-"*40)
+    print(f"Overall Turnout-Fraud Correlation: {pearson_fraud:.4f}")
+    print(f"Significance: {'Yes (p < 0.001)' if p_fraud < 0.001 else 'Yes (p < 0.05)' if p_fraud < 0.05 else 'No (p >= 0.05)'}")
+    print(f"Mean state-level correlation: {state_corr_df['Correlation'].mean():.4f}")
+    print(f"Std dev of state correlations: {state_corr_df['Correlation'].std():.4f}")
+    print(f"States with significant positive correlation (p<0.05): "
+          f"{len(state_corr_df[(state_corr_df['Correlation'] > 0) & (state_corr_df['P_value'] < 0.05)])}")
+    print(f"States with significant negative correlation (p<0.05): "
+          f"{len(state_corr_df[(state_corr_df['Correlation'] < 0) & (state_corr_df['P_value'] < 0.05)])}")
+    
+    return state_corr_df
+
+def create_turnout_fraud_visualizations(df):
+    """Create visualizations for turnout-fraud relationship"""
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig.suptitle('Turnout Rate vs Fraud Indicators Analysis', fontsize=16, fontweight='bold')
+    
+    # 1. Scatter plot: Turnout vs Fraud Score
+    scatter1 = axes[0, 0].scatter(df['turnout_rate'], df['fraud_score'], 
+                                  alpha=0.3, s=5, c=df['fraud_score'], cmap='Reds')
+    axes[0, 0].set_xlabel('Turnout Rate')
+    axes[0, 0].set_ylabel('Fraud Score')
+    axes[0, 0].set_title('Turnout Rate vs Fraud Score')
+    axes[0, 0].axvline(1.0, color='red', linestyle='--', alpha=0.5, label='100% turnout')
+    axes[0, 0].legend()
+    plt.colorbar(scatter1, ax=axes[0, 0])
+    
+    # 2. Box plot: Fraud scores by turnout ranges
+    turnout_bins = pd.cut(df['turnout_rate'], bins=[0, 0.4, 0.6, 0.8, 1.0, float('inf')],
+                          labels=['0-40%', '40-60%', '60-80%', '80-100%', '>100%'])
+    df['turnout_bin'] = turnout_bins
+    df.boxplot(column='fraud_score', by='turnout_bin', ax=axes[0, 1])
+    axes[0, 1].set_xlabel('Turnout Range')
+    axes[0, 1].set_ylabel('Fraud Score')
+    axes[0, 1].set_title('Fraud Score Distribution by Turnout Range')
+    
+    # 3. Anomaly rate by turnout quintile
+    if 'is_anomaly' in df.columns:
+        try:
+            quintiles = pd.qcut(df['turnout_rate'], 5, duplicates='drop')
+            anomaly_by_quintile = df.groupby(quintiles)['is_anomaly'].mean() * 100
+            axes[0, 2].bar(range(len(anomaly_by_quintile)), anomaly_by_quintile.values)
+            axes[0, 2].set_xlabel('Turnout Quintile')
+            axes[0, 2].set_ylabel('Anomaly Rate (%)')
+            axes[0, 2].set_title('Anomaly Rate by Turnout Quintile')
+            axes[0, 2].set_xticks(range(len(anomaly_by_quintile)))
+            axes[0, 2].set_xticklabels([f'Q{i+1}' for i in range(len(anomaly_by_quintile))])
+        except:
+            axes[0, 2].text(0.5, 0.5, 'Insufficient data for quintile analysis', 
+                          ha='center', va='center')
+    
+    # 4. Histogram: Turnout distribution colored by anomaly
+    if 'is_anomaly' in df.columns:
+        normal = df[df['is_anomaly'] == 0]['turnout_rate']
+        anomalous = df[df['is_anomaly'] == 1]['turnout_rate']
+        axes[1, 0].hist([normal, anomalous], bins=30, label=['Normal', 'Anomalous'],
+                       color=['blue', 'red'], alpha=0.6)
+        axes[1, 0].set_xlabel('Turnout Rate')
+        axes[1, 0].set_ylabel('Frequency')
+        axes[1, 0].set_title('Turnout Distribution by Anomaly Status')
+        axes[1, 0].axvline(1.0, color='black', linestyle='--', alpha=0.5)
+        axes[1, 0].legend()
+    
+    # 5. State-level correlation heatmap (top 20 states)
+    state_corr = []
+    top_states = df['State'].value_counts().head(20).index
+    for state in top_states:
+        state_data = df[df['State'] == state].copy()
+        # Clean the data - remove NaN and infinite values
+        state_data = state_data.dropna(subset=['turnout_rate', 'fraud_score'])
+        state_data = state_data[(np.isfinite(state_data['turnout_rate'])) & 
+                                (np.isfinite(state_data['fraud_score']))]
+        
+        if len(state_data) >= 20:
+            try:
+                corr, _ = pearsonr(state_data['turnout_rate'], state_data['fraud_score'])
+                state_corr.append(corr)
+            except:
+                state_corr.append(0)
+        else:
+            state_corr.append(0)
+    
+    axes[1, 1].barh(range(len(state_corr)), state_corr)
+    axes[1, 1].set_yticks(range(len(state_corr)))
+    axes[1, 1].set_yticklabels(top_states, fontsize=8)
+    axes[1, 1].set_xlabel('Correlation (Turnout vs Fraud Score)')
+    axes[1, 1].set_title('State-Level Turnout-Fraud Correlations')
+    axes[1, 1].axvline(0, color='black', linestyle='-', alpha=0.3)
+    
+    # 6. Regression plot with confidence interval
+    from scipy import stats
+    clean_df = df.dropna(subset=['turnout_rate', 'fraud_score'])
+    x = clean_df['turnout_rate']
+    y = clean_df['fraud_score']
+    
+    # Fit regression
+    slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+    line = slope * x + intercept
+    
+    axes[1, 2].scatter(x, y, alpha=0.3, s=5)
+    axes[1, 2].plot(x, line, color='red', label=f'y={slope:.2f}x+{intercept:.2f}\nR²={r_value**2:.3f}')
+    axes[1, 2].set_xlabel('Turnout Rate')
+    axes[1, 2].set_ylabel('Fraud Score')
+    axes[1, 2].set_title('Linear Regression: Turnout vs Fraud Score')
+    axes[1, 2].legend()
+    
+    plt.tight_layout()
+    plt.savefig('turnout_fraud_correlation.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+
 # GEOGRAPHIC ANALYSIS
+
+
 def analyze_by_geography(df):
     """Analyze fraud patterns by geographic location"""
     print("\n" + "="*50)
@@ -380,13 +805,15 @@ def analyze_by_geography(df):
     
     return state_analysis, lga_analysis
 
-def state_anomaly_rates_with_ci(df):
+def state_anomaly_rates_with_ci(df, show_all=True):
     """Calculate anomaly rates by state with confidence intervals"""
     anomaly_by_state = df.groupby('State').agg(
         Anomalous_units=('is_anomaly', 'sum'),
         Total_units=('is_anomaly', 'count'),
-        Anomaly_rate=('is_anomaly', 'mean')
-    )
+        Anomaly_rate=('is_anomaly', 'mean'),
+        Avg_fraud_score=('fraud_score', 'mean'),
+        Avg_turnout=('turnout_rate', 'mean')
+    ).round(4)
     
     # Compute Wilson 95% confidence intervals
     ci_results = []
@@ -401,8 +828,31 @@ def state_anomaly_rates_with_ci(df):
     
     anomaly_by_state['lower_CI'], anomaly_by_state['upper_CI'] = zip(*ci_results)
     
-    return anomaly_by_state.sort_values('Anomaly_rate', ascending=False)
+    # Sort by anomaly rate
+    anomaly_by_state = anomaly_by_state.sort_values('Anomaly_rate', ascending=False)
+    
+    # Print all states if requested
+    if show_all:
+        print("\n" + "="*80)
+        print("ANOMALY RATES FOR ALL STATES")
+        print("="*80)
+        print(f"{'State':<20} {'Anomaly Rate':<15} {'95% CI':<20} {'Avg Fraud Score':<15} {'Units':<10}")
+        print("-"*80)
+        
+        for state, row in anomaly_by_state.iterrows():
+            ci_str = f"[{row['lower_CI']:.3f}-{row['upper_CI']:.3f}]"
+            print(f"{state:<20} {row['Anomaly_rate']:.3f} ({row['Anomaly_rate']*100:.1f}%) "
+                  f"{ci_str:<20} {row['Avg_fraud_score']:<15.3f} {int(row['Total_units']):<10}")
+        
+        print("-"*80)
+        print(f"Total States: {len(anomaly_by_state)}")
+        print(f"Mean Anomaly Rate: {anomaly_by_state['Anomaly_rate'].mean():.3f}")
+        print(f"Std Dev: {anomaly_by_state['Anomaly_rate'].std():.3f}")
+    
+    return anomaly_by_state
+
 # COMPETITIVENESS ANALYSIS
+
 def competitiveness_metrics(votes):
     """Compute electoral competitiveness metrics"""
     votes = np.array(votes, dtype=float)
@@ -438,6 +888,7 @@ def analyze_competitiveness(df):
     print("="*50)
     
     party_cols = ['APC', 'PDP', 'LP', 'NNPP']
+    
     # National metrics
     nat_votes = df[party_cols].sum(axis=0)
     national_metrics = competitiveness_metrics(nat_votes)
@@ -452,9 +903,10 @@ def analyze_competitiveness(df):
             competitiveness_metrics, axis=1
         )
         state_metrics_df = pd.DataFrame(state_metrics.tolist(), index=state_metrics.index)
-     
+        
         print("\nTop 5 most competitive states (by ENP):")
         print(state_metrics_df.nlargest(5, 'ENP')[['ENP', 'Winner_margin_pp']])
+        
         print("\nTop 5 least competitive states (by ENP):")
         print(state_metrics_df.nsmallest(5, 'ENP')[['ENP', 'Winner_margin_pp']])
     
@@ -467,9 +919,11 @@ def analyze_competitiveness(df):
     
     print("\nFraud by competitiveness level:")
     print(tbl)
+    
     return national_metrics, state_metrics_df if 'State' in df.columns else None
 
 # VISUALIZATION
+
 def create_comprehensive_visualizations(df):
     """Create publication-ready visualizations"""
     fig, axes = plt.subplots(3, 3, figsize=(20, 18))
@@ -563,9 +1017,8 @@ def create_comprehensive_visualizations(df):
     plt.savefig('comprehensive_fraud_analysis.png', dpi=300, bbox_inches='tight')
     plt.show()
 
-
-
 # MODEL VALIDATION
+
 def validate_fraud_detection(df):
     """Validate fraud detection approach using cross-validation"""
     print("\n" + "="*50)
@@ -608,6 +1061,7 @@ def validate_fraud_detection(df):
     for result in validation_results:
         print(f"  {result['test_state']}: {result['anomaly_rate']:.3f} anomaly rate "
               f"({result['test_samples']:,} units)")
+    
     # Clustering validation
     X = df[ml_features].fillna(0)
     X_scaled = StandardScaler().fit_transform(X)
@@ -627,6 +1081,7 @@ def validate_fraud_detection(df):
     return validation_results, silhouette_scores
 
 # SUMMARY REPORTS
+
 def generate_fraud_summary(df):
     """Generate comprehensive fraud detection summary"""
     print("\n" + "="*50)
@@ -648,10 +1103,12 @@ def generate_fraud_summary(df):
         'Zero Competition': df['zero_competition'].sum(),
         'Suspicious Round Numbers': df['suspicious_rounds'].sum()
     }
+    
     print("\nFraud Indicators Detected:")
     for indicator, count in fraud_stats.items():
         pct = count / total_units * 100
         print(f"  {indicator}: {count:,} units ({pct:.2f}%)")
+    
     # Fraud score distribution
     fraud_dist = df['fraud_score'].value_counts().sort_index()
     print("\nFraud Score Distribution:")
@@ -715,10 +1172,409 @@ def export_results_to_excel(df, state_analysis, lga_analysis, filename='fraud_an
     
     print(f"\nResults exported to {filename}")
 
+# ADDITIONAL ANALYSIS
+
+def calculate_geographic_gini(df):
+    """Calculate Gini coefficient for geographic distribution of votes and anomalies"""
+    print("\n" + "="*80)
+    print("GEOGRAPHIC GINI COEFFICIENT ANALYSIS")
+    print("="*80)
+    
+    def gini_coefficient(x):
+        """Calculate Gini coefficient for a distribution"""
+        x = np.array(x)
+        x = x[~np.isnan(x)]
+        if len(x) == 0:
+            return np.nan
+        
+        sorted_x = np.sort(x)
+        n = len(x)
+        index = np.arange(1, n + 1)
+        return (2 * np.sum(index * sorted_x)) / (n * np.sum(sorted_x)) - (n + 1) / n
+    
+    # 1. Vote distribution Gini by state
+    print("\n1. VOTE DISTRIBUTION INEQUALITY (by State)")
+    print("-"*50)
+    
+    state_votes = df.groupby('State')['vote_total'].sum().values
+    vote_gini = gini_coefficient(state_votes)
+    print(f"Gini coefficient for state vote distribution: {vote_gini:.4f}")
+    print(f"Interpretation: {'High' if vote_gini > 0.4 else 'Moderate' if vote_gini > 0.3 else 'Low'} inequality")
+    
+    # 2. Anomaly concentration Gini
+    print("\n2. ANOMALY CONCENTRATION INEQUALITY")
+    print("-"*50)
+    
+    if 'is_anomaly' in df.columns:
+        state_anomalies = df.groupby('State')['is_anomaly'].sum().values
+        anomaly_gini = gini_coefficient(state_anomalies)
+        print(f"Gini coefficient for anomaly distribution: {anomaly_gini:.4f}")
+        print(f"Interpretation: Anomalies are {'highly concentrated' if anomaly_gini > 0.5 else 'moderately concentrated' if anomaly_gini > 0.3 else 'evenly distributed'}")
+    
+    # 3. Party-specific geographic concentration
+    print("\n3. PARTY VOTE GEOGRAPHIC CONCENTRATION")
+    print("-"*50)
+    
+    parties = ['APC', 'LP', 'PDP', 'NNPP']
+    party_ginis = {}
+    
+    for party in parties:
+        party_by_state = df.groupby('State')[party].sum().values
+        gini = gini_coefficient(party_by_state)
+        party_ginis[party] = gini
+        print(f"{party}: Gini = {gini:.4f}")
+    
+    # 4. LGA-level analysis (within states)
+    print("\n4. WITHIN-STATE INEQUALITY (Top 5 States)")
+    print("-"*50)
+    
+    top_states = df['State'].value_counts().head(5).index
+    state_lga_ginis = {}
+    
+    for state in top_states:
+        state_data = df[df['State'] == state]
+        if 'LGA' in state_data.columns:
+            lga_votes = state_data.groupby('LGA')['vote_total'].sum().values
+            if len(lga_votes) > 1:
+                gini = gini_coefficient(lga_votes)
+                state_lga_ginis[state] = gini
+                print(f"{state}: Within-state Gini = {gini:.4f}")
+    
+    # Visualization
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # Plot 1: Lorenz curve for state votes
+    sorted_votes = np.sort(state_votes)
+    cum_votes = np.cumsum(sorted_votes) / np.sum(sorted_votes)
+    cum_states = np.arange(1, len(sorted_votes) + 1) / len(sorted_votes)
+    
+    axes[0, 0].plot([0, 1], [0, 1], 'k--', alpha=0.5, label='Perfect Equality')
+    axes[0, 0].plot(cum_states, cum_votes, 'b-', linewidth=2, label=f'Actual (Gini={vote_gini:.3f})')
+    axes[0, 0].fill_between(cum_states, cum_votes, cum_states, alpha=0.3)
+    axes[0, 0].set_xlabel('Cumulative Share of States')
+    axes[0, 0].set_ylabel('Cumulative Share of Votes')
+    axes[0, 0].set_title('Lorenz Curve: Vote Distribution by State')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # Plot 2: Party Gini comparison
+    axes[0, 1].bar(party_ginis.keys(), party_ginis.values(), color=['red', 'green', 'blue', 'orange'])
+    axes[0, 1].set_ylabel('Gini Coefficient')
+    axes[0, 1].set_title('Geographic Concentration by Party')
+    axes[0, 1].axhline(0.4, color='r', linestyle='--', alpha=0.5, label='High concentration')
+    axes[0, 1].legend()
+    
+    # Plot 3: State-level inequality
+    if state_lga_ginis:
+        axes[1, 0].barh(range(len(state_lga_ginis)), list(state_lga_ginis.values()))
+        axes[1, 0].set_yticks(range(len(state_lga_ginis)))
+        axes[1, 0].set_yticklabels(list(state_lga_ginis.keys()))
+        axes[1, 0].set_xlabel('Gini Coefficient')
+        axes[1, 0].set_title('Within-State Vote Inequality')
+    
+    # Plot 4: Anomaly concentration if available
+    if 'is_anomaly' in df.columns:
+        state_anomaly_rates = df.groupby('State')['is_anomaly'].mean().sort_values()
+        axes[1, 1].barh(range(len(state_anomaly_rates[-10:])), state_anomaly_rates[-10:].values)
+        axes[1, 1].set_yticks(range(len(state_anomaly_rates[-10:])))
+        axes[1, 1].set_yticklabels(state_anomaly_rates[-10:].index, fontsize=8)
+        axes[1, 1].set_xlabel('Anomaly Rate')
+        axes[1, 1].set_title('Top 10 States by Anomaly Rate')
+    
+    plt.tight_layout()
+    plt.savefig('geographic_gini_analysis.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    return {'vote_gini': vote_gini, 'party_ginis': party_ginis, 'state_lga_ginis': state_lga_ginis}
+
+def analyze_party_level_anomalies(df):
+    """Analyze anomalies at the party level"""
+    print("\n" + "="*80)
+    print("PARTY-LEVEL ANOMALY ANALYSIS")
+    print("="*80)
+    
+    parties = ['APC', 'LP', 'PDP', 'NNPP']
+    party_analysis = {}
+    
+    for party in parties:
+        print(f"\n{party} ANALYSIS")
+        print("-"*40)
+        
+        # Units where party won
+        party_won = df[df[['APC', 'LP', 'PDP', 'NNPP']].idxmax(axis=1) == party].copy()
+        
+        if len(party_won) == 0:
+            print(f"No polling units where {party} won")
+            continue
+        
+        # Calculate party-specific metrics
+        total_units = len(party_won)
+        anomalous_units = party_won['is_anomaly'].sum() if 'is_anomaly' in df.columns else 0
+        anomaly_rate = anomalous_units / total_units if total_units > 0 else 0
+        
+        # Average metrics
+        avg_turnout = party_won['turnout_rate'].mean()
+        avg_concentration = party_won['vote_concentration'].mean()
+        avg_fraud_score = party_won['fraud_score'].mean()
+        
+        # Perfect scores (100% of votes)
+        perfect_wins = ((party_won[party] == party_won['vote_total']) & 
+                       (party_won['vote_total'] > 10)).sum()
+        
+        # Suspicious patterns
+        suspicious_units = party_won[party_won['fraud_score'] >= 2].shape[0]
+        
+        # Statistical test for unusual concentration
+        from scipy.stats import kstest
+        # Test if vote concentration follows expected distribution
+        ks_stat, ks_pval = kstest(party_won['vote_concentration'].dropna(), 'uniform')
+        
+        party_analysis[party] = {
+            'total_units_won': total_units,
+            'anomalous_units': anomalous_units,
+            'anomaly_rate': anomaly_rate,
+            'perfect_wins': perfect_wins,
+            'suspicious_units': suspicious_units,
+            'avg_turnout': avg_turnout,
+            'avg_concentration': avg_concentration,
+            'avg_fraud_score': avg_fraud_score,
+            'ks_test_pval': ks_pval
+        }
+        
+        print(f"Units won: {total_units:,}")
+        print(f"Anomalous units: {anomalous_units:,} ({anomaly_rate*100:.2f}%)")
+        print(f"Perfect wins (100%): {perfect_wins:,}")
+        print(f"Suspicious units (fraud_score≥2): {suspicious_units:,}")
+        print(f"Average turnout: {avg_turnout:.3f}")
+        print(f"Average concentration: {avg_concentration:.3f}")
+        print(f"Average fraud score: {avg_fraud_score:.3f}")
+        print(f"KS test p-value: {ks_pval:.6f} ({'Abnormal' if ks_pval < 0.05 else 'Normal'})")
+        
+        # Z-score for anomaly rate comparison
+        if 'is_anomaly' in df.columns:
+            overall_anomaly_rate = df['is_anomaly'].mean()
+            n = len(party_won)
+            se = np.sqrt(overall_anomaly_rate * (1 - overall_anomaly_rate) / n)
+            z_score = (anomaly_rate - overall_anomaly_rate) / se if se > 0 else 0
+            print(f"Anomaly rate Z-score: {z_score:.2f} ({'Significant' if abs(z_score) > 1.96 else 'Not significant'})")
+    
+    # Comparative visualization
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # Plot 1: Anomaly rates by party
+    anomaly_rates = [party_analysis[p]['anomaly_rate'] * 100 for p in parties]
+    colors = ['red', 'green', 'blue', 'orange']
+    axes[0, 0].bar(parties, anomaly_rates, color=colors)
+    axes[0, 0].set_ylabel('Anomaly Rate (%)')
+    axes[0, 0].set_title('Anomaly Rates by Winning Party')
+    axes[0, 0].axhline(df['is_anomaly'].mean() * 100, color='black', linestyle='--', 
+                      alpha=0.5, label='Overall rate')
+    axes[0, 0].legend()
+    
+    # Plot 2: Fraud scores by party
+    fraud_scores = [party_analysis[p]['avg_fraud_score'] for p in parties]
+    axes[0, 1].bar(parties, fraud_scores, color=colors)
+    axes[0, 1].set_ylabel('Average Fraud Score')
+    axes[0, 1].set_title('Average Fraud Score by Winning Party')
+    
+    # Plot 3: Perfect wins comparison
+    perfect_wins = [party_analysis[p]['perfect_wins'] for p in parties]
+    axes[1, 0].bar(parties, perfect_wins, color=colors)
+    axes[1, 0].set_ylabel('Number of Perfect Wins (100%)')
+    axes[1, 0].set_title('Perfect Wins by Party')
+    
+    # Plot 4: Vote concentration distribution
+    for i, party in enumerate(parties):
+        party_won = df[df[['APC', 'LP', 'PDP', 'NNPP']].idxmax(axis=1) == party]
+        if len(party_won) > 0:
+            axes[1, 1].hist(party_won['vote_concentration'], bins=20, alpha=0.5, 
+                          label=party, color=colors[i])
+    axes[1, 1].set_xlabel('Vote Concentration')
+    axes[1, 1].set_ylabel('Frequency')
+    axes[1, 1].set_title('Vote Concentration Distribution by Winning Party')
+    axes[1, 1].legend()
+    
+    plt.tight_layout()
+    plt.savefig('party_level_anomaly_analysis.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    return party_analysis
+
+def integer_heaping_analysis(df):
+    """Analyze integer heaping in turnout and vote shares"""
+    print("\n" + "="*80)
+    print("INTEGER HEAPING ANALYSIS")
+    print("="*80)
+    
+    def heaping_test(values, target_ints, name):
+        """Test for heaping at specific integer values"""
+        results = []
+        values = values.dropna()
+        
+        if len(values) < 100:
+            return pd.DataFrame()
+        
+        # Create bins around target integers
+        for target in target_ints:
+            # Count observations within 0.5 of target
+            observed = ((values >= target - 0.5) & (values < target + 0.5)).sum()
+            
+            # Expected based on neighboring values
+            lower_window = ((values >= target - 1.5) & (values < target - 0.5)).sum()
+            upper_window = ((values >= target + 0.5) & (values < target + 1.5)).sum()
+            expected = (lower_window + upper_window) / 2
+            
+            if expected > 0:
+                # Z-score calculation
+                p_exp = expected / len(values)
+                p_obs = observed / len(values)
+                se = np.sqrt(p_exp * (1 - p_exp) / len(values))
+                z_score = (p_obs - p_exp) / se if se > 0 else 0
+                
+                results.append({
+                    'Target': target,
+                    'Observed': observed,
+                    'Expected': expected,
+                    'Ratio': observed / expected if expected > 0 else np.inf,
+                    'Z_score': z_score,
+                    'Significant': abs(z_score) > 2.58  # p < 0.01
+                })
+        
+        return pd.DataFrame(results)
+    
+    # 1. Turnout percentage heaping
+    print("\n1. TURNOUT PERCENTAGE HEAPING")
+    print("-"*40)
+    
+    turnout_pct = df['turnout_rate'] * 100
+    turnout_targets = [20, 25, 30, 40, 50, 60, 70, 75, 80, 90]
+    turnout_heaping = heaping_test(turnout_pct, turnout_targets, 'Turnout %')
+    
+    if not turnout_heaping.empty:
+        print(turnout_heaping.to_string(index=False))
+        significant_heaping = turnout_heaping[turnout_heaping['Significant']]
+        if not significant_heaping.empty:
+            print(f"\nSignificant heaping detected at: {significant_heaping['Target'].tolist()}")
+    
+    # 2. Leader (winner) vote share heaping
+    print("\n2. LEADER VOTE SHARE HEAPING")
+    print("-"*40)
+    
+    leader_share = (df['winner_votes'] / df['vote_total']) * 100
+    leader_targets = [50, 60, 66.67, 70, 75, 80, 90, 95]
+    leader_heaping = heaping_test(leader_share, leader_targets, 'Leader Share %')
+    
+    if not leader_heaping.empty:
+        print(leader_heaping.to_string(index=False))
+        significant_heaping = leader_heaping[leader_heaping['Significant']]
+        if not significant_heaping.empty:
+            print(f"\nSignificant heaping detected at: {significant_heaping['Target'].tolist()}")
+    
+    # 3. Raw vote count heaping (round numbers)
+    print("\n3. ROUND NUMBER HEAPING IN RAW VOTES")
+    print("-"*40)
+    
+    parties = ['APC', 'LP', 'PDP', 'NNPP']
+    round_number_bias = {}
+    
+    for party in parties:
+        party_votes = df[party][df[party] > 0]
+        
+        # Check for multiples of 10, 50, 100
+        mult_10 = (party_votes % 10 == 0).mean()
+        mult_50 = (party_votes % 50 == 0).mean()
+        mult_100 = (party_votes % 100 == 0).mean()
+        
+        # Expected frequencies (assuming uniform distribution of last digits)
+        expected_10 = 0.1
+        expected_50 = 0.02
+        expected_100 = 0.01
+        
+        # Z-scores
+        n = len(party_votes)
+        z_10 = (mult_10 - expected_10) / np.sqrt(expected_10 * (1 - expected_10) / n)
+        z_50 = (mult_50 - expected_50) / np.sqrt(expected_50 * (1 - expected_50) / n)
+        z_100 = (mult_100 - expected_100) / np.sqrt(expected_100 * (1 - expected_100) / n)
+        
+        round_number_bias[party] = {
+            'mult_10': mult_10,
+            'mult_50': mult_50,
+            'mult_100': mult_100,
+            'z_10': z_10,
+            'z_50': z_50,
+            'z_100': z_100
+        }
+        
+        print(f"\n{party}:")
+        print(f"  Multiples of 10: {mult_10:.3f} (Z={z_10:.2f})")
+        print(f"  Multiples of 50: {mult_50:.3f} (Z={z_50:.2f})")
+        print(f"  Multiples of 100: {mult_100:.3f} (Z={z_100:.2f})")
+    
+    # Visualization
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # Plot 1: Turnout heaping
+    if not turnout_heaping.empty:
+        axes[0, 0].bar(turnout_heaping['Target'], turnout_heaping['Z_score'])
+        axes[0, 0].axhline(2.58, color='r', linestyle='--', alpha=0.5, label='p=0.01')
+        axes[0, 0].axhline(-2.58, color='r', linestyle='--', alpha=0.5)
+        axes[0, 0].set_xlabel('Target Percentage')
+        axes[0, 0].set_ylabel('Z-score')
+        axes[0, 0].set_title('Turnout Percentage Heaping')
+        axes[0, 0].legend()
+    
+    # Plot 2: Leader share heaping
+    if not leader_heaping.empty:
+        axes[0, 1].bar(leader_heaping['Target'], leader_heaping['Z_score'])
+        axes[0, 1].axhline(2.58, color='r', linestyle='--', alpha=0.5, label='p=0.01')
+        axes[0, 1].axhline(-2.58, color='r', linestyle='--', alpha=0.5)
+        axes[0, 1].set_xlabel('Target Percentage')
+        axes[0, 1].set_ylabel('Z-score')
+        axes[0, 1].set_title('Leader Vote Share Heaping')
+        axes[0, 1].legend()
+    
+    # Plot 3: Round number bias by party
+    parties_list = list(round_number_bias.keys())
+    z_10_values = [round_number_bias[p]['z_10'] for p in parties_list]
+    z_50_values = [round_number_bias[p]['z_50'] for p in parties_list]
+    z_100_values = [round_number_bias[p]['z_100'] for p in parties_list]
+    
+    x = np.arange(len(parties_list))
+    width = 0.25
+    
+    axes[1, 0].bar(x - width, z_10_values, width, label='Mult of 10')
+    axes[1, 0].bar(x, z_50_values, width, label='Mult of 50')
+    axes[1, 0].bar(x + width, z_100_values, width, label='Mult of 100')
+    axes[1, 0].set_xlabel('Party')
+    axes[1, 0].set_ylabel('Z-score')
+    axes[1, 0].set_title('Round Number Bias in Raw Votes')
+    axes[1, 0].set_xticks(x)
+    axes[1, 0].set_xticklabels(parties_list)
+    axes[1, 0].axhline(2.58, color='r', linestyle='--', alpha=0.5)
+    axes[1, 0].legend()
+    
+    # Plot 4: Distribution of leader share with heaping points highlighted
+    axes[1, 1].hist(leader_share.dropna(), bins=50, alpha=0.7, color='blue')
+    for target in [50, 60, 70, 75, 80, 90]:
+        axes[1, 1].axvline(target, color='red', linestyle='--', alpha=0.5)
+    axes[1, 1].set_xlabel('Leader Vote Share (%)')
+    axes[1, 1].set_ylabel('Frequency')
+    axes[1, 1].set_title('Leader Vote Share Distribution with Heaping Targets')
+    
+    plt.tight_layout()
+    plt.savefig('integer_heaping_analysis.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    return {'turnout_heaping': turnout_heaping, 
+            'leader_heaping': leader_heaping,
+            'round_number_bias': round_number_bias}
+            
 # MAIN ANALYSIS PIPELINE
+
 def run_complete_analysis(filepath='Combined_election_verified.csv', 
                          export_excel=True, create_plots=True):
-    """Run the complete fraud detection analysis pipeline"""
+    
+    # Run the complete fraud detection analysis pipeline 
     
     print("="*60)
     print("NIGERIAN ELECTION FRAUD DETECTION ANALYSIS")
@@ -733,20 +1589,35 @@ def run_complete_analysis(filepath='Combined_election_verified.csv',
     df = create_fraud_features(df)
     print("\nFeature engineering completed")
     
-    # Machine learning anomaly detection
-    df, models, scaler, ml_results = detect_anomalies_ml(df)
+    # Machine learning anomaly detection (ENHANCED VERSION)
+    df, models, scaler, ml_results = detect_anomalies_ml_enhanced(df)
     
     # Statistical tests
-    benford_results = perform_benford_analysis(df)
+    benford_results = perform_comprehensive_benford_analysis(df)
     last_digit_results = last_digit_analysis(df)
     turnout_party_correlation(df, party='APC')
     
+    # Forensic indicators correlation matrix
+    correlation_matrix, z_scores_matrix = forensic_indicators_correlation_matrix(df)
+    
     # Geographic analysis
     state_analysis, lga_analysis = analyze_by_geography(df)
-    anomaly_rates = state_anomaly_rates_with_ci(df)
+    anomaly_rates = state_anomaly_rates_with_ci(df, show_all=True)  # Show all states
+    
+    # Geographic Gini analysis
+    gini_results = calculate_geographic_gini(df)
+    
+    # Party-level anomaly analysis
+    party_anomaly_results = analyze_party_level_anomalies(df)
+    
+    # Integer heaping analysis
+    heaping_results = integer_heaping_analysis(df)
     
     # Competitiveness analysis
     national_comp, state_comp = analyze_competitiveness(df)
+    
+    # Turnout-fraud correlation analysis
+    turnout_correlation_results = turnout_fraud_correlation_analysis(df)
     
     # Validation
     validation_results, silhouette_scores = validate_fraud_detection(df)
@@ -757,6 +1628,7 @@ def run_complete_analysis(filepath='Combined_election_verified.csv',
     # Create visualizations
     if create_plots:
         create_comprehensive_visualizations(df)
+        create_turnout_fraud_visualizations(df)  # Additional turnout-fraud plots
     
     # Export to Excel
     if export_excel:
@@ -774,10 +1646,16 @@ def run_complete_analysis(filepath='Combined_election_verified.csv',
         'lga_analysis': lga_analysis,
         'ml_results': ml_results,
         'benford_results': benford_results,
-        'validation_results': validation_results
+        'validation_results': validation_results,
+        'correlation_matrix': correlation_matrix,
+        'gini_results': gini_results,
+        'party_anomaly_results': party_anomaly_results,
+        'heaping_results': heaping_results,
+        'turnout_correlation_results': turnout_correlation_results
     }
 
 # EXECUTION
+
 if __name__ == "__main__":
     # Run the complete analysis
     results = run_complete_analysis(
@@ -791,5 +1669,5 @@ if __name__ == "__main__":
     print(f"Detected {results['dataframe']['is_anomaly'].sum():,} anomalous units")
     print("\nResults saved to:")
     print("  - comprehensive_fraud_analysis.png (visualizations)")
-    print("  - fraud_analysis_results.xlsx (detailed results)"
+    print("  - fraud_analysis_results.xlsx (detailed results)")
     print("\nMain dataframe available in: results['dataframe']")
